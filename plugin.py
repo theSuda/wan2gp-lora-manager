@@ -12,7 +12,53 @@ import re
 import traceback
 import html as html_lib
 from urllib.parse import urlparse, parse_qs
+import functools
+import inspect
 from shared.utils.plugins import WAN2GPPlugin
+
+# Verbose terminal logging. Set env var LORA_MANAGER_DEBUG=0 to silence.
+DEBUG = os.environ.get("LORA_MANAGER_DEBUG", "1") != "0"
+
+def log(msg):
+    """Debug print that can never raise (e.g. on consoles that can't encode some characters)."""
+    if not DEBUG: return
+    try:
+        print(f"[LoRA Manager] {msg}", flush=True)
+    except Exception:
+        try: print(f"[LoRA Manager] {msg}".encode("ascii", "replace").decode("ascii"), flush=True)
+        except Exception: pass
+
+def _short(v, n=80):
+    s = repr(v)
+    return s if len(s) <= n else s[:n] + "..."
+
+def _logged(fn):
+    """Log entry, exit time and full traceback of any error for a plugin method."""
+    try: param_names = list(inspect.signature(fn).parameters)[1:]
+    except (TypeError, ValueError): param_names = []
+    secret = {"key", "api_key"}
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        shown = []
+        for i, a in enumerate(args[1:]):
+            name = param_names[i] if i < len(param_names) else ""
+            if name in secret: shown.append(f"{name}=<{'set' if a else 'empty'}>")
+            elif not isinstance(a, (dict, list)) or len(repr(a)) < 120: shown.append(_short(a))
+        args_txt = ", ".join(shown)
+        log(f"-> {fn.__name__}({args_txt})")
+        t0 = time.time()
+        try:
+            result = fn(*args, **kwargs)
+        except Exception:
+            log(f"!! {fn.__name__} FAILED after {time.time() - t0:.2f}s:")
+            traceback.print_exc()
+            raise
+        log(f"<- {fn.__name__} done in {time.time() - t0:.2f}s")
+        return result
+    return wrapper
+
+log(f"plugin module imported (gradio {getattr(gr, '__version__', '?')}, file {os.path.abspath(__file__)})")
 
 CIVITAI_HOST = "https://civitai.com"
 REST_URL = "https://civitai.com/api/v1/models"
@@ -100,24 +146,28 @@ class LoraManagerPlugin(WAN2GPPlugin):
         self.manager_to_browser_state = None
         self.civit_tabs = None
         self.api_key = None
+        log(f"plugin instance created (cwd={os.getcwd()}, plugin_dir={self.plugin_dir})")
 
     def setup_ui(self):
         self.request_global("get_lora_dir")
         self.request_global("get_state_model_type")
-        self.request_global("model_types") 
-        self.request_global("get_model_name") 
+        self.request_global("model_types")
+        self.request_global("get_model_name")
 
         self.request_component("state")
-        self.request_component("prompt") 
+        self.request_component("prompt")
         self.request_component("loras_choices")
         self.request_component("main_tabs")
-        
+        log("requested globals: get_lora_dir, get_state_model_type, model_types, get_model_name; components: state, prompt, loras_choices, main_tabs")
+
         self.load_settings()
+        log(f"settings loaded from {self.settings_path} (keys: {sorted(k for k in self.saved_settings if k != 'api_key')}, api_key set: {bool(self.saved_settings.get('api_key'))})")
         self.load_civitai_enums()
 
         self.on_tab_outputs = []
 
         self.add_custom_js("""
+            console.log("[LoRA Manager] JS snippet start");
             window.civitSelectCard = function(id) {
                 const container = document.getElementById('civit_bridge_input');
                 if (!container) return;
@@ -151,7 +201,9 @@ class LoraManagerPlugin(WAN2GPPlugin):
                 textarea.value = JSON.stringify(current);
                 textarea.dispatchEvent(new Event('input', { bubbles: true }));
             }
+            console.log("[LoRA Manager] JS snippet loaded OK");
         """)
+        log("custom JS registered")
 
         self.add_tab(
             tab_id="lora_manager_tab",
@@ -166,6 +218,7 @@ class LoraManagerPlugin(WAN2GPPlugin):
             component_constructor=self.create_browser_ui,
             position=3
         )
+        log("tabs registered: 'LoRA Manager', 'CivitAI Browser' - setup_ui complete")
 
     def load_settings(self):
         if os.path.exists(self.settings_path):
@@ -559,6 +612,7 @@ class LoraManagerPlugin(WAN2GPPlugin):
                     self.use_btn = gr.Button("✨ Send to Generator", variant="primary")
 
         self.on_tab_outputs = [self.is_initialized, self.category_dropdown, self.lora_html_list]
+        log("LoRA Manager UI built (on_tab_outputs: is_initialized, category_dropdown, lora_html_list)")
 
         self.category_dropdown.change(self.render_lora_grid, [self.state, self.category_dropdown, self.lora_selection_state], [self.lora_html_list])
         self.refresh_btn.click(self.ui_refresh_click, [self.state, self.category_dropdown, self.lora_selection_state], [self.category_dropdown, self.lora_html_list])
@@ -689,6 +743,8 @@ class LoraManagerPlugin(WAN2GPPlugin):
 
         self.back_btn.click(lambda: gr.Tabs(selected="browse_tab"), None, self.civit_tabs)
         self.dl_btn.click(self.download_model, [self.file_dd, self.api_key, self.state, self.civit_model_data, self.target_folder], [self.dl_status])
+        log(f"CivitAI Browser UI built: {len(self.civit_base_models)} base models, {len(self.civit_model_types)} types, "
+            f"saved filters sort={d_sort!r} period={d_period!r} types={d_types} base={d_base} page_size={d_page_size}")
 
     def match_base_models(self, text):
         """All base models containing every word of `text` (case-insensitive, any order)."""
@@ -840,6 +896,7 @@ class LoraManagerPlugin(WAN2GPPlugin):
             data = r.json()
             items = data.get("items", []) or []
             meta = data.get("metadata", {}) or {}
+            log(f"GET {r.url} -> HTTP {r.status_code}, {len(items)} items, nextCursor={meta.get('nextCursor')!r}")
             nxt = meta.get("nextCursor")
             if nxt is None and meta.get("nextPage"):
                 nxt = (parse_qs(urlparse(meta["nextPage"]).query).get("cursor") or [None])[0]
@@ -1307,5 +1364,19 @@ class LoraManagerPlugin(WAN2GPPlugin):
                     final_loras.append(l)
             
         gr.Info(f"Injected {len(selected_loras) if selected_loras else 0} LoRAs and {len(selected_prompts) if selected_prompts else 0} prompts")
-        return new_prompt, final_loras, self.goto_video_tab(None)
+        # WanGP v20+ provides goto_media_tab; older versions had goto_video_tab.
+        goto = getattr(self, "goto_media_tab", None) or getattr(self, "goto_video_tab", None)
+        return new_prompt, final_loras, (goto(None) if goto else gr.update())
+
+
+# Wrap UI builders and event handlers so every call, its duration and any traceback is logged.
+for _name in [
+    "load_civitai_enums", "create_manager_ui", "create_browser_ui", "on_tab_select",
+    "force_refresh", "render_lora_grid", "batch_update_metadata",
+    "run_search", "next_page", "prev_page", "fetch_page",
+    "on_select_model", "update_version_files", "download_model", "create_finetune_definition",
+    "bridge_manager_to_browser", "update_action_options", "finalize_injection",
+    "filter_base_choices", "select_base_matches",
+]:
+    setattr(LoraManagerPlugin, _name, _logged(getattr(LoraManagerPlugin, _name)))
 
